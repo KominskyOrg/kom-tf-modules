@@ -1,0 +1,287 @@
+data "aws_route53_zone" "primary" {
+  name = var.domain_name
+}
+
+----
+
+resource "kubernetes_namespace" "gocd" {
+  metadata {
+    name = "gocd"
+  }
+}
+
+resource "kubernetes_deployment" "gocd_server" {
+  provider = kubernetes
+  metadata {
+    name      = "gocd-server"
+    namespace = kubernetes_namespace.gocd.metadata[0].name
+    labels = {
+      app = "gocd-server"
+    }
+  }
+
+  spec {
+    replicas = 1
+
+    selector {
+      match_labels = {
+        app = "gocd-server"
+      }
+    }
+
+    template {
+      metadata {
+        labels = {
+          app = "gocd-server"
+        }
+      }
+
+      spec {
+        security_context {
+          fs_group    = 1000
+          run_as_user = 1000
+        }
+        container {
+          name  = "gocd-server"
+          image = "gocd/gocd-server:v23.2.0"
+          port {
+            container_port = var.gocd_server_port
+          }
+          volume_mount {
+            mount_path = "/home/go"
+            name       = "gocd-server-storage"
+          }
+          env {
+            name  = "GOCD_PLUGIN_INSTALL_github-oath-authorization-plugin"
+            value = "https://github.com/gocd-contrib/github-oauth-authorization-plugin/releases/download/v3.4.0-281/github-oauth-authorization-plugin-3.4.0-281.jar"
+          }
+        }
+
+
+
+        volume {
+          name = "gocd-server-storage"
+
+          persistent_volume_claim {
+            claim_name = kubernetes_persistent_volume_claim.server_pvc.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_service" "gocd_server_service" {
+  metadata {
+    name      = "gocd-server-service"
+    namespace = kubernetes_namespace.gocd.metadata[0].name
+  }
+
+  spec {
+    selector = kubernetes_deployment.gocd_server.metadata[0].labels
+    port {
+      port        = 80
+      target_port = var.gocd_server_port
+    }
+    type = "LoadBalancer"
+  }
+}
+
+resource "kubernetes_deployment" "gocd_agent" {
+  provider = kubernetes
+  metadata {
+    name      = "gocd-agent"
+    namespace = kubernetes_namespace.gocd.metadata[0].name
+    labels = {
+      app = "gocd-agent"
+    }
+  }
+
+  spec {
+    replicas = 1
+
+    selector {
+      match_labels = {
+        app = "gocd-agent"
+      }
+    }
+
+    template {
+      metadata {
+        labels = {
+          app = "gocd-agent"
+        }
+      }
+
+      spec {
+        security_context {
+          fs_group    = 1000
+          run_as_user = 1000
+        }
+        container {
+          name  = "gocd-agent"
+          image = "gocd/gocd-agent-alpine-3.18:v23.2.0"
+
+          env {
+            name  = "GO_SERVER_URL"
+            value = "http://dualstack.${kubernetes_service.gocd_server_service.status.0.load_balancer.0.ingress.0.hostname}/go"
+          }
+          volume_mount {
+            mount_path = "/home/go"
+            name       = "gocd-agent-storage"
+          }
+        }
+
+        volume {
+          name = "gocd-agent-storage"
+
+          persistent_volume_claim {
+            claim_name = kubernetes_persistent_volume_claim.agent_pvc.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+}
+
+----
+
+resource "kubernetes_storage_class" "ebs_sc" {
+  metadata {
+    name = "ebs-sc"
+  }
+  storage_provisioner    = "ebs.csi.aws.com"
+  reclaim_policy         = "Retain"
+  allow_volume_expansion = true
+  parameters = {
+    fsType    = "ext4"
+    encrypted = "true"
+  }
+}
+
+resource "kubernetes_persistent_volume_claim" "server_pvc" {
+  metadata {
+    name      = "${var.cluster_name}-gocd-server-pvc"
+    namespace = "gocd"
+  }
+  spec {
+    access_modes = ["ReadWriteOnce"]
+    resources {
+      requests = {
+        storage = "5Gi"
+      }
+    }
+    storage_class_name = kubernetes_storage_class.ebs_sc.metadata.0.name
+  }
+}
+
+resource "kubernetes_persistent_volume_claim" "agent_pvc" {
+  metadata {
+    name      = "${var.cluster_name}-gocd-agent-pvc"
+    namespace = "gocd"
+  }
+  spec {
+    access_modes = ["ReadWriteOnce"]
+    resources {
+      requests = {
+        storage = "5Gi"
+      }
+    }
+    storage_class_name = kubernetes_storage_class.ebs_sc.metadata.0.name
+  }
+}
+
+----
+
+provider "kubernetes" {
+  host                   = var.eks_cluster_endpoint
+  cluster_ca_certificate = base64decode(var.eks_cluster_ca_cert)
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    args        = ["eks", "get-token", "--cluster-name", var.cluster_name]
+    command     = "aws"
+  }
+}
+
+----
+
+<!-- BEGIN_TF_DOCS -->
+## Requirements
+
+No requirements.
+
+## Providers
+
+| Name | Version |
+|------|---------|
+| <a name="provider_aws"></a> [aws](#provider\_aws) | n/a |
+| <a name="provider_kubernetes"></a> [kubernetes](#provider\_kubernetes) | n/a |
+
+## Modules
+
+No modules.
+
+## Resources
+
+| Name | Type |
+|------|------|
+| [aws_route53_record.subdomain_record](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record) | resource |
+| [kubernetes_deployment.gocd_agent](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/deployment) | resource |
+| [kubernetes_deployment.gocd_server](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/deployment) | resource |
+| [kubernetes_namespace.gocd](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/namespace) | resource |
+| [kubernetes_persistent_volume_claim.agent_pvc](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/persistent_volume_claim) | resource |
+| [kubernetes_persistent_volume_claim.server_pvc](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/persistent_volume_claim) | resource |
+| [kubernetes_service.gocd_server_service](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/service) | resource |
+| [kubernetes_storage_class.ebs_sc](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/storage_class) | resource |
+| [aws_route53_zone.primary](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/route53_zone) | data source |
+
+## Inputs
+
+| Name | Description | Type | Default | Required |
+|------|-------------|------|---------|:--------:|
+| <a name="input_cluster_name"></a> [cluster\_name](#input\_cluster\_name) | Name of the cluster | `string` | n/a | yes |
+| <a name="input_domain_name"></a> [domain\_name](#input\_domain\_name) | The name of your domain. (example.com) | `string` | n/a | yes |
+| <a name="input_eks_cluster_ca_cert"></a> [eks\_cluster\_ca\_cert](#input\_eks\_cluster\_ca\_cert) | n/a | `any` | n/a | yes |
+| <a name="input_eks_cluster_endpoint"></a> [eks\_cluster\_endpoint](#input\_eks\_cluster\_endpoint) | n/a | `any` | n/a | yes |
+| <a name="input_gocd_server_port"></a> [gocd\_server\_port](#input\_gocd\_server\_port) | Port number the GoCD server will be exposed on. | `number` | n/a | yes |
+| <a name="input_subdomain_name"></a> [subdomain\_name](#input\_subdomain\_name) | Subdomain name (ie sudomain.domain) | `string` | n/a | yes |
+
+## Outputs
+
+No outputs.
+<!-- END_TF_DOCS -->
+----
+
+resource "aws_route53_record" "subdomain_record" {
+  zone_id = data.aws_route53_zone.primary.zone_id
+  name    = "${var.subdomain_name}.${var.domain_name}"
+  type    = "CNAME"
+  ttl     = 300
+  records = ["dualstack.${kubernetes_service.gocd_server_service.status.0.load_balancer.0.ingress.0.hostname}"]
+}
+
+----
+
+variable "subdomain_name" {
+    type = string
+    description = "Subdomain name (ie sudomain.domain)"
+}
+variable "gocd_server_port" {
+    type = number
+    description = "Port number the GoCD server will be exposed on."
+}
+variable "eks_cluster_endpoint" {}
+variable "eks_cluster_ca_cert" {}
+
+variable "domain_name" {
+  type = string
+  description = "The name of your domain. (example.com)"
+}
+
+variable "cluster_name" {
+  type = string
+  description = "Name of the cluster"
+}
+
+----
+

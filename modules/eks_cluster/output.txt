@@ -1,0 +1,298 @@
+resource "aws_eks_addon" "aws_ebs_csi" {
+  cluster_name  = aws_eks_cluster.eks_cluster.name
+  addon_name    = "aws-ebs-csi-driver"
+  addon_version = "v1.21.0-eksbuild.1"
+}
+
+resource "aws_iam_openid_connect_provider" "oidc_provider" {
+  url             = aws_eks_cluster.eks_cluster.identity[0].oidc[0].issuer
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["9e99a48a9960b14926bb7f3b02e22da2b0ab7280"]
+}
+
+resource "aws_iam_role" "role" {
+  name = "AWS-EBS-CSI-Role"
+
+  assume_role_policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::${var.account_number}:oidc-provider/oidc.eks.${var.region}.amazonaws.com/id/${var.oidc_number}"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.${var.region}.amazonaws.com/id/${var.oidc_number}:aud": "sts.amazonaws.com",
+          "oidc.eks.${var.region}.amazonaws.com/id/${var.oidc_number}:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa"
+        }
+      }
+    }
+  ]
+}
+EOF
+}
+
+resource "aws_iam_role_policy" "policy" {
+  name = "AWS-EBS-CSI-Policy"
+  role = aws_iam_role.role.id
+
+  policy = <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateSnapshot",
+                "ec2:CreateVolume",
+                "ec2:CreateTags",
+                "ec2:AttachVolume",
+                "ec2:DetachVolume",
+                "ec2:DeleteVolume",
+                "ec2:DeleteSnapshot",
+                "ec2:ModifyVolume",
+                "ec2:DescribeAvailabilityZones",
+                "ec2:DescribeInstances",
+                "ec2:DescribeSnapshots",
+                "ec2:DescribeTags",
+                "ec2:DescribeVolumes",
+                "ec2:DescribeVolumesModifications"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+EOF
+}
+
+
+----
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+----
+
+locals {
+  cluster_config = {
+    name     = var.cluster_name
+    role_arn = aws_iam_role.cluster_role.arn
+    version  = "1.27"
+  }
+
+  node_group_config = {
+    cluster_name    = aws_eks_cluster.eks_cluster.name
+    node_group_name = "${var.cluster_name}-node-group"
+    node_role_arn   = aws_iam_role.node_group_role.arn
+    subnet_ids      = var.subnet_ids
+    scaling_config = {
+      desired_size = 1
+      min_size     = 1
+      max_size     = 2
+    }
+    remote_access = {
+      ec2_ssh_key               = var.pem_name
+      source_security_group_ids = [var.sg_id]
+    }
+  }
+}
+
+resource "aws_eks_cluster" "eks_cluster" {
+  name     = local.cluster_config.name
+  role_arn = local.cluster_config.role_arn
+  version  = local.cluster_config.version
+
+  vpc_config {
+    subnet_ids = var.subnet_ids
+  }
+}
+
+resource "aws_eks_node_group" "eks_node_group" {
+  cluster_name    = local.node_group_config.cluster_name
+  node_group_name = local.node_group_config.node_group_name
+  node_role_arn   = local.node_group_config.node_role_arn
+  subnet_ids      = local.node_group_config.subnet_ids
+
+  scaling_config = local.node_group_config.scaling_config
+
+  remote_access = local.node_group_config.remote_access
+
+  depends_on = [aws_eks_cluster.eks_cluster]
+}
+
+----
+
+locals {
+  ec2_actions = [
+    "ec2:CreateSnapshot",
+    "ec2:CreateVolume",
+    "ec2:CreateTags",
+    "ec2:AttachVolume",
+    "ec2:DetachVolume",
+    "ec2:DeleteVolume",
+    "ec2:DeleteSnapshot",
+    "ec2:ModifyVolume",
+    "ec2:DescribeAvailabilityZones",
+    "ec2:DescribeInstances",
+    "ec2:DescribeSnapshots",
+    "ec2:DescribeTags",
+    "ec2:DescribeVolumes",
+    "ec2:DescribeVolumesModifications"
+  ]
+
+  role_principals = {
+    "eks.amazonaws.com"  = "eks.amazonaws.com",
+    "ec2.amazonaws.com"  = "ec2.amazonaws.com",
+    "oidc.amazonaws.com" = "oidc.eks.${var.region}.amazonaws.com/id/${var.oidc_number}"
+  }
+
+  role_names = {
+    "eks.amazonaws.com"  = "${var.cluster_name}-eks-role",
+    "ec2.amazonaws.com"  = "${var.cluster_name}-eks-node-group-role",
+    "oidc.amazonaws.com" = "AWS-EBS-CSI-Role"
+  }
+
+  role_policies = {
+    "eks.amazonaws.com"  = ["arn:aws:iam::aws:policy/AmazonEKSClusterPolicy", "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"],
+    "ec2.amazonaws.com"  = ["arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy", "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy", "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"],
+    "oidc.amazonaws.com" = []
+  }
+}
+
+resource "aws_iam_role" "role" {
+  for_each = local.role_principals
+
+  name = local.role_names[each.key]
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect    = "Allow",
+        Principal = { Federated = each.value },
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "policy_attachment" {
+  for_each = { for key, policies in local.role_policies : key => policies }
+
+  role       = aws_iam_role.role[each.key].id
+  policy_arn = each.value
+}
+
+resource "aws_iam_role_policy" "policy" {
+  name = "AWS-EBS-CSI-Policy"
+  role = aws_iam_role.role["oidc.amazonaws.com"].id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect   = "Allow",
+        Action   = local.ec2_actions,
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+data "aws_iam_policy_document" "ebs_csi_driver" {
+  statement {
+    actions   = local.ec2_actions
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "ebs_csi_driver" {
+  name   = "EBS_CSI_Driver"
+  policy = data.aws_iam_policy_document.ebs_csi_driver.json
+}
+
+resource "aws_iam_role_policy_attachment" "ebs_csi_driver" {
+  role       = aws_iam_role.role["ec2.amazonaws.com"].id
+  policy_arn = aws_iam_policy.ebs_csi_driver.arn
+}
+
+----
+
+
+output "eks_cluster_endpoint" {
+  value = aws_eks_cluster.eks_cluster.endpoint
+}
+
+output "eks_cluster_ca_cert" {
+  value = aws_eks_cluster.eks_cluster.certificate_authority[0].data
+}
+
+----
+
+provider "kubernetes" {
+  host                   = aws_eks_cluster.eks_cluster.endpoint
+  cluster_ca_certificate = base64decode(aws_eks_cluster.eks_cluster.certificate_authority[0].data)
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.eks_cluster.name]
+    command     = "aws"
+  }
+}
+
+----
+
+variable "vpc_id" {
+  type        = string
+  description = "The VPC ID of the VPC to be attached to this cluster."
+}
+
+variable "vpc_cidr" {
+  type        = string
+  description = "The CIDR block of the VPC to be used."
+}
+
+variable "subnet_ids" {
+  type        = list(string)
+  description = "The Subent IDs of the subets."
+}
+
+variable "sg_id" {
+  type        = string
+  description = "Security Group ID"
+}
+
+variable "pem_name" {
+  type        = string
+  description = "Name of the pem key that is connected to your AWS account."
+}
+
+variable "region" {
+  type        = string
+  description = "AWS region"
+}
+
+variable "account_number" {
+  type        = string
+  description = "AWS account number"
+}
+
+variable "oidc_number" {
+  type        = string
+  description = "The OICD number attached to your cluster."
+}
+
+variable "domain_name" {
+  type        = string
+  description = "The name of your domain. (example.com)"
+}
+
+variable "cluster_name" {
+  type        = string
+  description = "Name of the cluster"
+}
+
+----
+
